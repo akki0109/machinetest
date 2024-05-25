@@ -1,0 +1,77 @@
+stages:
+  - build
+  - deploy
+
+
+create_dist:
+  stage: build
+  image: node:12.20.2-alpine3.10
+  allow_failure: false
+  script: |
+    echo "Installing curl"
+    apk --no-cache add curl
+
+    echo "Installing JQ"
+    apk --no-cache add jq
+
+    echo "Installing git"
+    apk --no-cache add git
+
+    echo "Creating version"
+    APP_VERSION=$(cat ./package.json | jq -r '.version')
+    echo "$APP_VERSION"
+
+    echo "Tagging build"
+    git config user.email "${GITLAB_USER_EMAIL}"
+    git config user.name "${GITLAB_USER_NAME}"
+    git remote add api-origin https://oauth2:${GITLAB_ACCESS_TOKEN}@gitlab.com/${CI_PROJECT_PATH}
+    git tag -a "$APP_VERSION" -m "Version $APP_VERSION"
+    git push api-origin "$APP_VERSION"
+
+    echo "Installing dependencies"
+    npm install -g @angular/cli@10.0.8
+
+    echo "Installing npm modules"
+    npm install
+
+    echo "Building distribution"
+    ng build --prod
+
+    echo "Creating artifact..."
+    tar -vzcf ${APP_NAME}_${APP_VERSION}.tar.gz dist
+    curl --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+      --upload-file ${APP_NAME}_${APP_VERSION}.tar.gz \
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/frontend/${APP_VERSION}/${APP_NAME}_${APP_VERSION}.tar.gz"
+  only:
+    refs:
+      - master
+
+
+deploy_to_storage:
+  stage: deploy
+  image: python:alpine
+  when: manual
+  allow_failure: false
+  script: |
+    pip install awscli
+
+    echo "Unpacking artifact"
+    APP_VERSION=$(cat ./package.json |  python3 -c "import sys, json; print(json.load(sys.stdin)['version'])")
+    wget --header="JOB-TOKEN: $CI_JOB_TOKEN" \
+      ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/frontend/${APP_VERSION}/${APP_NAME}_${APP_VERSION}.tar.gz
+    mkdir ./package
+    tar -vxzf  ${APP_NAME}_${APP_VERSION}.tar.gz  --directory ./package
+
+    echo "Delete previous version"
+    aws s3 rm s3://${S3_BUCKET} --recursive --region ${AWS_REGION}
+
+    echo "Uploading verison to S3..."
+    aws s3 cp ./package/dist/dev-tools s3://${S3_BUCKET}/ --recursive --region ${AWS_REGION}
+
+    echo "Creating CDN invalidation"
+    aws cloudfront create-invalidation \
+          --distribution-id ${CDN_DISTRIBUTION_ID} \
+          --paths "/*"
+  only:
+    refs:
+      - master
